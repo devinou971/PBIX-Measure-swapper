@@ -1,7 +1,7 @@
 /*
  * PBIX Measure Swapper
  * SPDX-License-Identifier: MIT
- * Copyright (c) 2026 PBIX Measure Swapper Contributors
+ * Copyright (c) 2026 PBIX Measure Swapper Devinou971
  * See LICENSE file in the project root
  */
 
