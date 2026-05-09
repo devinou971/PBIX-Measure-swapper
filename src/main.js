@@ -71,75 +71,117 @@ function toUtf16LE(str) {
   return bytes;
 }
 
+async function buildDownloadUrl(zipWriter, outputFileName){
+    const blobURL = URL.createObjectURL(await zipWriter.close());
+    const a = document.createElement("a")
+    a.href = blobURL;
+    a.download = outputFileName;
+    a.innerText = "Download";
+    
+    for(let child of linkPosition.childNodes){
+        linkPosition.removeChild(child)
+    }
+    
+    linkPosition.appendChild(a);
+}
+
+async function deleteSecurityBindingsFromContentTypes(contentTypesFile){
+    if(contentTypesFile === undefined){
+        throw "Error : PBIX Report doesn't contain [Content_Types].xml file"
+    }
+    const contentTypes = await contentTypesFile.getData(new zip.TextWriter());
+    const xmlParser = new DOMParser();
+    let newXmlContent;
+    try {
+        const xmlObject = xmlParser.parseFromString(contentTypes, "text/xml");    
+        var secObject = xmlObject.querySelector('[PartName="/SecurityBindings"]')
+        if (secObject){
+            secObject.remove();
+        }
+        newXmlContent = '<?xml version="1.0" encoding="utf-8"?>' + new XMLSerializer().serializeToString(xmlObject.documentElement); 
+    } catch (error) {
+        throw "Error : PBIX file not valid. Could not parse [Content_Types].xml file";
+    }
+    return newXmlContent
+}
+
+async function modifyLayoutFile(layoutFile){
+    if(layoutFile === undefined){
+        throw "Error : PBIX file not valid. Could not find the Report/Layout file.";
+    }
+    const layoutBlobContent = await layoutFile.getData( new zip.BlobWriter());
+    const layoutBytes = await layoutBlobContent.bytes();
+
+    let newLayoutContent = layoutBytes.join(",")
+    newLayoutContent = newLayoutContent.replaceAll(
+        toUtf16LE(`\\"${measureToReplace.value}\\"`).join(","), 
+        toUtf16LE(`\\"${replacementMeasure.value}\\"`).join(",")
+    );
+    newLayoutContent = newLayoutContent.replaceAll(
+        toUtf16LE(`\\"${tableToReplace.value}.${measureToReplace.value}\\"`).join(","), 
+        toUtf16LE(`\\"${replacementTable.value}.${replacementMeasure.value}\\"`).join(",")
+    );
+    newLayoutContent = newLayoutContent.split(",");
+    let newLayoutBytesContent = new Uint8Array(newLayoutContent.length);
+    for(let byteIndex = 0; byteIndex < newLayoutContent.length; byteIndex ++){
+        newLayoutBytesContent[byteIndex]= parseInt(newLayoutContent[byteIndex]);
+    }
+
+    return newLayoutBytesContent;
+}
+
 async function replaceMeasure(){
     if(checkArguments()){
         const zipWriter = new zip.ZipWriter(new zip.BlobWriter("application/zip"), { keepOrder: false });
-        const file = fileInput.files[0];
-        const zipFile = new zip.ZipReader(new zip.BlobReader(file))
         
-        let contentFiles = await zipFile.getEntries();
+        const file = fileInput.files[0];
+        let zipFile;
+        let contentFiles;
+        try {
+            zipFile = new zip.ZipReader(new zip.BlobReader(file));
+            contentFiles = await zipFile.getEntries();
+        } catch (error) {
+            alert("Error : PBIX file not valid. Could unzip the pbix file. Are you sure this is a PowerBI report ?");
+            return;
+        }
 
         // Deleting the SecurityBindings
         contentFiles = contentFiles.filter((x) => {return x.filename != "SecurityBindings"})
         
         // Modifying the [Content_Types].xml
         const contentTypesFile = contentFiles.find((x) => {return x.filename == "[Content_Types].xml"})
-        const contentTypes = await contentTypesFile.getData(new zip.TextWriter());
-        const xmlParser = new DOMParser();
-        const xmlObject = xmlParser.parseFromString(contentTypes, "text/xml");
-        var secObject = xmlObject.querySelector('[PartName="/SecurityBindings"]')
-        if (secObject){
-            secObject.remove();
+        let newXmlContent;
+        try{
+            newXmlContent = await deleteSecurityBindingsFromContentTypes(contentTypesFile);
+        } catch(error){
+            alert(error);
+            return;
         }
-        const newXmlContent = '<?xml version="1.0" encoding="utf-8"?>' + new XMLSerializer().serializeToString(xmlObject.documentElement); 
 
         // Modifying the Layout
-        const layoutFile = contentFiles.find((x) => {return x.filename.endsWith("Report/Layout")});
-        const layoutBlobContent = await layoutFile.getData( new zip.BlobWriter());
-        const layoutBytes = await layoutBlobContent.bytes();
-
-        let newLayoutContent = layoutBytes.join(",")
-        newLayoutContent = newLayoutContent.replaceAll(
-            toUtf16LE(`\\"${measureToReplace.value}\\"`).join(","), 
-            toUtf16LE(`\\"${replacementMeasure.value}\\"`).join(",")
-        );
-        newLayoutContent = newLayoutContent.replaceAll(
-            toUtf16LE(`\\"${tableToReplace.value}.${measureToReplace.value}\\"`).join(","), 
-            toUtf16LE(`\\"${replacementTable.value}.${replacementMeasure.value}\\"`).join(",")
-        );
-        newLayoutContent = newLayoutContent.split(",");
-        let newLayoutBytesContent = new Uint8Array(newLayoutContent.length);
-        for(let byteIndex = 0; byteIndex < newLayoutContent.length; byteIndex ++){
-            newLayoutBytesContent[byteIndex]= parseInt(newLayoutContent[byteIndex]);
+        const layoutFile = contentFiles.find((x) => {return x.filename == "Report/Layout"});
+        let newLayoutBytesContent;
+        try {
+            newLayoutBytesContent = await modifyLayoutFile(layoutFile)
+        } catch (error) {
+            alert(error);
+            return;
         }
 
         // Rebuilding the zip file
         // - Adding the new [Content_Types].xml
-
         zipWriter.add("[Content_Types].xml", new zip.TextReader(newXmlContent));
         // - Adding the new Layout
         zipWriter.add("Report/Layout", new zip.BlobReader(new Blob([newLayoutBytesContent])));
-
         // - Adding the other files
+        contentFiles = contentFiles.filter((x) => {return x.filename != "Report/Layout" && x.filename != "[Content_Types].xml"})
         for(let file of contentFiles){
-            if(file.filename != "[Content_Types].xml" && file.filename != "Report/Layout"){
-                const blob =await file.getData(new zip.BlobWriter());
-                const fileReader = new zip.BlobReader(blob);
-                zipWriter.add(file.filename, fileReader);
-            }
+            const blob =await file.getData(new zip.BlobWriter());
+            const fileReader = new zip.BlobReader(blob);
+            zipWriter.add(file.filename, fileReader);
         }
 
         // - Buidling download url
-        const blobURL = URL.createObjectURL(await zipWriter.close());
-        const a = document.createElement("a")
-        a.href = blobURL;
-        a.download = file.name;
-        a.innerText = "Download";
-        
-        for(let child of linkPosition.childNodes){
-            linkPosition.removeChild(child)
-        }
-        
-        linkPosition.appendChild(a);
+        await buildDownloadUrl(zipWriter, file.name)
     }
 }
