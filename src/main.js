@@ -105,26 +105,164 @@ async function deleteSecurityBindingsFromContentTypes(contentTypesFile){
     return newXmlContent
 }
 
+function findAllNodesWithPropertyName(node, propertyName){
+    let results = [];
+    if(typeof(node) == "object" && Object.keys(node).includes(propertyName)){
+        results = results.concat([node]);
+        return results;
+    }
+    if(typeof(node) == "object"){
+        for(let i of Object.keys(node)){
+            const item = node[i];
+            if (typeof(item) == "object"){
+                results = results.concat(findAllNodesWithPropertyName(item, propertyName));
+            }
+        }    
+    } 
+    return results;
+}
+
+function findAllPathsToNodesWithPropertyName(node, propertyName, master=""){
+    if(node === null){
+        return []
+    }
+
+    if(typeof(node) == "object" && Object.keys(node).includes(propertyName)){
+        return [master];
+    }
+
+    let results = [];
+
+    if (typeof(node) == "object"){
+        for(let i of Object.keys(node)){
+            let item = node[i];
+            if(typeof(item) == "object"){
+                results = results.concat(findAllPathsToNodesWithPropertyName(item, propertyName, `${master}|${i}`));
+            } else if (typeof(item) == "string" && item.length > 0 && (item[0] == "{" || item[0] == "[")){
+                try {
+                    const newNode = JSON.parse(item);
+                    results = results.concat(findAllPathsToNodesWithPropertyName(newNode, propertyName, `${master}|${i}|$`));
+                } catch (error) {
+                }
+            }
+            
+        }
+    }
+
+    return results;
+}
+
+function extractTableCodes(nodeList){
+    const res = []
+    for(let node of nodeList){
+        res.push(node["Name"]);
+    }
+    return res;
+}
+
+function findNodeByPropertyValue(nodeList, propertyName, value){
+    for(let node of nodeList){
+        if(Object.keys(node).includes(propertyName) && node[propertyName] == value){
+            return node
+        }
+    }
+}
+
+function buildNewQueryFromStringNode(node, path, measureToReplace, tableToReplace, replacementMeasure, replacementTable){
+    const root = JSON.parse(node);
+    let n = root;
+    const steps = path.split("|");
+    for(let step of steps){
+        if(typeof(n) == "object"){
+            n = n[step];
+        }
+    }
+    const tableNode = findNodeByPropertyValue(n["From"], "Entity", tableToReplace);
+    if (tableNode == null){
+        return node;
+    }
+
+    const measureParents = findAllNodesWithPropertyName(n, "Measure");
+
+    for(const measureParent of measureParents){
+        if (measureParent["Measure"]["Property"] == measureToReplace){ 
+            let newTableCode = "";
+            const replacementTableCode = findNodeByPropertyValue(n["From"], "Entity", replacementTable)
+            if(replacementTableCode){
+                newTableCode = replacementTableCode["Name"];
+            }
+            else{
+                newTableCode = replacementTable[0].toLowerCase();
+                let subId = 0;
+                while (extractTableCodes(n["From"]).includes(`${newTableCode}${subId}`)){
+                    subId += 1;
+                }
+                newTableCode = `${newTableCode}${subId}`;
+                n["From"].push({"Name": newTableCode, "Entity": replacementTable, "Type":0})
+            }
+            measureParent["Measure"]["Expression"]["SourceRef"]["Source"] = newTableCode
+            measureParent["Measure"]["Property"] = replacementMeasure
+            if(Object.keys(measureParent).includes("Name")){ 
+                measureParent["Name"] = `${replacementTable}.${replacementMeasure}`
+            }
+        }
+    }
+    return JSON.stringify(root);
+}
+
 async function modifyLayoutFile(layoutFile){
     if(layoutFile === undefined){
         throw "Error : PBIX file not valid. Could not find the Report/Layout file.";
     }
     const layoutBlobContent = await layoutFile.getData( new zip.BlobWriter());
-    const layoutBytes = await layoutBlobContent.bytes();
 
-    let newLayoutContent = layoutBytes.join(",")
+    const layoutBytes = await layoutBlobContent.bytes();
+    const layoutString = new TextDecoder('utf-16le').decode(layoutBytes);
+    let layouObject;
+    try {
+        layouObject = JSON.parse(layoutString);
+    } catch (error) {
+        throw "PBIX file not valid. Could not parse the Layout File to JSON.";
+    }
+
+    const allPathsToFromNodes = findAllPathsToNodesWithPropertyName(layouObject, "From");
+
+    for(const path of allPathsToFromNodes){
+        let n = layouObject;
+        const pathBeforeSecondParse = path.split("|$|")[0]
+        const pathAfterSecondParse = path.split("|$|")[1]
+        const steps = pathBeforeSecondParse.split("|")
+        steps.shift()
+        const lastStep = steps.pop(-1)
+        for(let step of steps){
+            n = n[step]
+        }
+        
+        if(n[lastStep].includes(measureToReplace.value)){
+            n[lastStep] = buildNewQueryFromStringNode(n[lastStep], pathAfterSecondParse, measureToReplace.value, tableToReplace.value, replacementMeasure.value, replacementTable.value)
+        }
+    }
+
+    let newLayoutContent = JSON.stringify(layouObject);
+
     newLayoutContent = newLayoutContent.replaceAll(
-        toUtf16LE(`\\"${measureToReplace.value}\\"`).join(","), 
-        toUtf16LE(`\\"${replacementMeasure.value}\\"`).join(",")
+        `{\\"SourceRef\\":{\\"Entity\\":\\"${tableToReplace.value}\\"}},\\"Property\\":\\"${measureToReplace.value}\\"}}`,
+        `{\\"SourceRef\\":{\\"Entity\\":\\"${replacementTable.value}\\"}},\\"Property\\":\\"${replacementMeasure.value}\\"}}`
+    );
+
+    newLayoutContent = newLayoutContent.replaceAll(
+        `\\"${tableToReplace.value}.${measureToReplace.value}\\"`,
+        `\\"${replacementTable.value}.${replacementMeasure.value}\\"`
     );
     newLayoutContent = newLayoutContent.replaceAll(
-        toUtf16LE(`\\"${tableToReplace.value}.${measureToReplace.value}\\"`).join(","), 
-        toUtf16LE(`\\"${replacementTable.value}.${replacementMeasure.value}\\"`).join(",")
+        `\\"${measureToReplace.value}\\"`,
+        `\\"${replacementMeasure.value}\\"`
     );
-    newLayoutContent = newLayoutContent.split(",");
-    let newLayoutBytesContent = new Uint8Array(newLayoutContent.length);
-    for(let byteIndex = 0; byteIndex < newLayoutContent.length; byteIndex ++){
-        newLayoutBytesContent[byteIndex]= parseInt(newLayoutContent[byteIndex]);
+    
+    const newUtf16LayoutContent = toUtf16LE(newLayoutContent);
+    let newLayoutBytesContent = new Uint8Array(newUtf16LayoutContent.length);
+    for(let byteIndex = 0; byteIndex < newUtf16LayoutContent.length; byteIndex ++){
+        newLayoutBytesContent[byteIndex]= parseInt(newUtf16LayoutContent[byteIndex]);
     }
 
     return newLayoutBytesContent;
